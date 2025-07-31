@@ -1,0 +1,16 @@
+{
+  "name": "easyagent",
+  "version": "0.0.1",
+  "description": "A library that contains a very basic agent management class for handling tool calls via the responses API. Handles back and forth communication of tool calls and responses.",
+  "license": "ISC",
+  "author": "Sam Pazdan (Pazdan Technologies, LLC)",
+  "type": "module",
+  "main": "agent.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node agent.js"
+  },
+  "dependencies": {
+    "openai": "^5.11.0"
+  }
+}
