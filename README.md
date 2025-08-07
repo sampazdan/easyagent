@@ -4,11 +4,13 @@
 *This documentation is still crude… Bear with me!*
 
 ---
+
 The true power of LLMs resides in function calling.
 
 It is, then, a shame that the function-calling workflow in OpenAI’s Responses API is so primitive, especially with streamed responses. Currently, the user must manually manage the entirety of the two-turn function-calling paradigm within their code. It gets messy quickly — 100+ line event-consuming switch cases, roundabout logic for parallelized function calling, piles of deeply nested JSON, and thread management all contribute to a bag of bloat that drags down even the simplest of applications.
 
 These problems were all meant to be addressed by the Assistants API, but it has since been discontinued with the vague promise of eventual “feature parity” with the Responses API. That has not even partially occured yet, so I’m doing it myself.
+
 ---
 
 ### Usage
