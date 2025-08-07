@@ -2,6 +2,7 @@
 ## Function calling agents made easy
 
 *This documentation is still crude… Bear with me!*
+
 ---
 The true power of LLMs resides in function calling.
 
@@ -9,6 +10,7 @@ It is, then, a shame that the function-calling workflow in OpenAI’s Responses 
 
 These problems were all meant to be addressed by the Assistants API, but it has since been discontinued with the vague promise of eventual “feature parity” with the Responses API. That has not even partially occured yet, so I’m doing it myself.
 ---
+
 ### Usage
 
 `import Agent from "easyagent"`
