@@ -1,116 +1,197 @@
-import OpenAI from "openai";
-import { ToolNotDefinedError, ContextNotDefinedError } from "./errors.js";
+import OpenAI from "openai"
+import { ToolNotDefinedError, ModelProviderError, InvalidThreadError } from "./errors.js"
+import { AgentStream } from "./agent_stream.js"
 
 export class Agent {
-  constructor({ apiKey, model = "gpt-4o", tools = [], toolFns = {}, sysPrompt = "Hello!" }) {
-    this.gpt = new OpenAI({ apiKey });
-    this._seedId = null;
-    this._seeding = null;
-    this.model = model;
-    this.tools = tools;
-    this.toolFns = toolFns;
-    this.sysPrompt = sysPrompt;
-    this.threads = [];
-    for (const t of tools) {
-      if (typeof toolFns[t.name] !== "function") throw new ToolNotDefinedError(`Tool ${t.name} not defined`);
-    }
-  }
+    constructor({
+        apiKey, 
+        model, 
+        toolDefinitions = [], 
+        toolFunctions = {}, 
+        systemPrompt = "You are a helpful assistant!"
+    }) {
 
-  async init() {
-    this._seeding = await this.gpt.responses
-      .create({ model: this.model, input: this.sysPrompt, tools: this.tools, stream: false })
-      .then(r => (this._seedId = r.id));
-  }
+        // Public internal vars
+        this.model = model
+        this.toolDefinitions = toolDefinitions
+        this.toolFunctions = toolFunctions
+        this.systemPrompt = systemPrompt
+        this.threads = {}
 
-  addThread(id = this.threads.length) {
-    if (!this._seedId) throw new ContextNotDefinedError("Call Agent.init() first");
-    const t = new Thread({ id, head: this._seedId, meta: {} });
-    this.threads.push(t);
-    return t;
-  }
+        // Private internal vars
+        this._instance = new OpenAI({ apiKey })
+        this._seedId = null     // contains the response ID for the response created after the model receives its system context.
 
-  async process(thread, input) {
-    thread.userHistory.push(input);
-    return await this.#streamLoop(thread, input);
-  }
-
-  async #streamLoop(thread, userInput, injected = null) {
-    const isToolFollowUp = injected !== null;
-
-    const pastUsers = isToolFollowUp
-      ? []
-      : thread.userHistory
-          .slice(0, -1)
-          .map(txt => ({ role: "user", content: txt }));
-
-    const payload = isToolFollowUp
-      ? injected // already an array with function_call_output object
-      : [{ role: "user", content: userInput }];
-
-    const req = {
-      model: this.model,
-      previous_response_id: thread.head,
-      input: [...pastUsers, ...payload],
-      tools: this.tools,
-      stream: true
-    };
-
-    let stream = await this.gpt.responses.create(req);
-    thread.head = stream.id;
-
-    for await (const ev of stream) {
-      if (ev.type === "response.output_text.delta") process.stdout.write(ev.delta);
-
-      if (ev.type === "response.function_call") {
-        const { name, call_id } = ev;
-        let argStr = "";
-        for await (const part of stream) {
-          if (part.type === "response.function_call.arguments.delta") argStr += part.delta;
-          if (part.type === "response.function_call.arguments.done") break;
+        for (const f of toolDefinitions) {
+            const func = toolFunctions[f.name]
+            if (typeof(func) !== 'function'){
+                throw new ToolNotDefinedError(`Tool ${f.name} does not have a valid function definition in toolFunctions.`)
+            }
         }
-        const args = JSON.parse(argStr);
-        const fn = this.toolFns[name];
-        if (!fn) throw new ToolNotDefinedError(name);
-        const result = await fn(args);
-        return await this.#streamLoop(thread, null, [
-          { type: "function_call_output", call_id, output: result }
-        ]);
-      }
     }
-  }
+
+    async init() {
+        let models
+
+        // retrieve models -- if failed, model provider error
+        try {
+            models = await this._instance.models.list()
+        } catch (err) {
+            throw new ModelProviderError(`Failed to instantiate OpenAI instance. Verify API key and organization settings.\nOpenAI message: ${err?.error?.message}`)
+        }
+
+        // ensure Agent's model is in the list of available models, if not, model provider error
+        const availableModelIds = Array.isArray(models?.data) ? models.data.map(m => m.id) : []
+
+        if (!availableModelIds.includes(this.model)) {
+            throw new ModelProviderError(`Model \"${this.model}\" was not found in the provider's available models. Available models: \n\n${availableModelIds.join(", ")}`)
+        }
+    }
+
+    /*
+        Creates a new thread and returns the id of the thread.
+        ID is the index of the thread in self.threads if not provided.
+    */
+    createThread(id = Object.keys(this.threads).length, meta = {}) {
+        if(id in this.threads) throw new InvalidThreadError(`Thread already exists with ID: ${id}`)
+        const thread = new Thread({ id, meta });
+        this.threads[id] = thread;
+        return thread.id;
+    }
+
+    /*
+        Returns the full thread object given a valid ID
+    */
+    getThread(id){
+        const thread = this.threads[id]
+        if (!thread) throw new InvalidThreadError("Thread ID invalid.")
+        return thread
+    }
+
+    /*
+        Agent.run -- The stateful orchestrator
+    */
+    async run(threadId, content, stream = true) {
+        const thread = this.threads[threadId]
+        if(!thread) throw new InvalidThreadError("Thread ID invalid.")
+        
+        const agentStream = new AgentStream()
+
+        // Callback to be called once the current turn is complete
+        // Should we pull new inputs and update the thread here or append? Hm...
+        const onComplete = (responseId, newContent) => {
+            // console.log(`onComplete() called, request complete! Params: ${responseId} ::: ${newContent}`)
+            thread.head = responseId
+            thread.content.push(newContent)
+        }
+
+        setImmediate(async () => {
+            await this.#generate(thread, content, agentStream, onComplete)
+        })
+
+        return agentStream
+    }
+
+    /*
+        Agent.generate() -- The stateless worker
+    */
+    async #generate(thread, content, agentStream, onComplete, stream = true, is_function_output = false){
+
+        const request = this.#generateRequest(thread, content, stream)
+
+        const responseStream = await this._instance.responses.create(request)
+
+        let new_response_id = null
+
+        // Main handler of incoming events from ModelProvider
+        for await (const ev of responseStream){
+            switch(ev.type){
+                case "response.output_item.added": 
+                    if(ev.item.type === "function_call") {
+                        // console.log("FUNC CHOICE = ", ev.item.name)
+                        agentStream.emitToolStart(ev.item.name)
+                    }
+                    break
+
+                case "response.output_item.done":
+                    if(ev.item.type === "function_call") {
+                        agentStream.emitToolExecute(ev.item.name, ev.item.arguments)
+
+                        if(new_response_id) thread.head = new_response_id
+
+                        const func = this.toolFunctions[ev.item.name]
+                        if(!func) {
+                            throw new ToolNotDefinedError(`No tool defined with name ${ev.item.name}`)
+                        }
+
+                        const function_result = await func(JSON.parse(ev.item.arguments))
+
+                        const func_output_content = this.#generateFunctionCallOutput(function_result, ev.item.call_id)
+
+                        this.#generate(thread, func_output_content, agentStream, onComplete)
+                    }
+                    break
+
+                case "response.created":
+                    agentStream.emitStart()
+                    new_response_id = ev.response.id
+                    break
+                case "response.output_text.delta":
+                    agentStream.emitData(ev.delta)
+                    break
+                // case "response.output_text.done":
+                //     agentStream.emitData(ev.text)
+                //     break;
+                // case "response.function_call"
+                default:
+                    // console.log(ev)
+                    break
+
+
+            }
+        }
+
+        onComplete(new_response_id, "somemsg")
+
+
+        // return responseStream
+    }
+
+    #generateRequest(thread, content, stream = true){
+        return {
+            model: this.model,
+            previous_response_id: thread.head,
+            instructions: this.systemPrompt,
+            input: content,
+            tools: this.toolDefinitions,
+            stream,
+            parallel_tool_calls: false
+        }
+    }
+
+    // type: "function_call_output", call_id, output
+    #generateFunctionCallOutput(output, call_id) {
+        return [{
+            type: "function_call_output",
+            call_id,
+            output: JSON.stringify(output)
+        }]
+    }
+
+
 }
+
 
 export class Thread {
-  constructor({ id, head, meta }) {
-    this.id = id;
-    this.head = head;
-    this.meta = meta;
-    this.trace = [];
-    this.userHistory = [];
-  }
-}
+    constructor({
+        id,
+        meta
+    }) {
+        this.id = id
+        this.meta = meta
 
-/* tests */
-const TestAgent = new Agent({
-  apiKey: process.env.GODSHALL_OPENAI_KEY,
-  tools: [
-    {
-      type: "function",
-      name: "add_number",
-      description: "Add two numbers together",
-      parameters: {
-        type: "object",
-        properties: { a: { type: "number" }, b: { type: "number" } },
-        required: ["a", "b"],
-        additionalProperties: false
-      }
+        //head -- used for previous_response_id and points to the previous message
+        this.head = null
+        this.content = []
     }
-  ],
-  toolFns: { add_number: ({ a, b }) => a + b }
-});
-
-await TestAgent.init();
-const thread1 = TestAgent.addThread();
-await TestAgent.process(thread1, "Hey, remember this secret phrase: 'bigbrowncat'");
-await TestAgent.process(thread1, "What was the secret phrase?");
-console.log("\n\nDONE");
+}
