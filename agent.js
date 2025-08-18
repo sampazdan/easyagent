@@ -1,6 +1,7 @@
 import OpenAI from "openai"
 import { ToolNotDefinedError, ModelProviderError, InvalidThreadError } from "./errors.js"
 import { AgentStream } from "./agent_stream.js"
+import { Thread } from "./thread.js"
 
 export class Agent {
     constructor({
@@ -82,7 +83,7 @@ export class Agent {
         const onComplete = (responseId, newContent) => {
             // console.log(`onComplete() called, request complete! Params: ${responseId} ::: ${newContent}`)
             thread.head = responseId
-            thread.content.push(newContent)
+            // thread.content.push(newContent)
         }
 
         setImmediate(async () => {
@@ -95,12 +96,11 @@ export class Agent {
     /*
         Agent.generate() -- The stateless worker
     */
-    async #generate(thread, content, agentStream, onComplete, stream = true, is_function_output = false){
+    async #generate(thread, content, agentStream, onComplete, stream = true, ) {
 
         const request = this.#generateRequest(thread, content, stream)
-
         const responseStream = await this._instance.responses.create(request)
-
+        const functionQueue = []
         let new_response_id = null
 
         // Main handler of incoming events from ModelProvider
@@ -117,18 +117,19 @@ export class Agent {
                     if(ev.item.type === "function_call") {
                         agentStream.emitToolExecute(ev.item.name, ev.item.arguments)
 
-                        if(new_response_id) thread.head = new_response_id
-
                         const func = this.toolFunctions[ev.item.name]
                         if(!func) {
                             throw new ToolNotDefinedError(`No tool defined with name ${ev.item.name}`)
                         }
 
-                        const function_result = await func(JSON.parse(ev.item.arguments))
+                        const fc = new FunctionCall({
+                            name: ev.item.name,
+                            args: ev.item.arguments,
+                            call_id: ev.item.call_id,
+                            func
+                        })
 
-                        const func_output_content = this.#generateFunctionCallOutput(function_result, ev.item.call_id)
-
-                        this.#generate(thread, func_output_content, agentStream, onComplete)
+                        functionQueue.push(fc)
                     }
                     break
 
@@ -137,12 +138,30 @@ export class Agent {
                     new_response_id = ev.response.id
                     break
                 case "response.output_text.delta":
-                    agentStream.emitData(ev.delta)
+                    agentStream.emitText(ev.delta)
                     break
                 // case "response.output_text.done":
                 //     agentStream.emitData(ev.text)
                 //     break;
                 // case "response.function_call"
+
+                case "response.completed":
+                    if(new_response_id) thread.head = new_response_id
+                    if(functionQueue.length > 0) {
+                        await Promise.all(functionQueue.map(fc => fc.awaitCompletion()))
+
+                        let outputs = []
+                        for (const fc of functionQueue){
+                            agentStream.emitToolResult(fc.name, fc.result, fc.error)
+                            outputs.push(fc.generateOutput())
+                        }
+                        return await this.#generate(thread, outputs, agentStream, onComplete)
+                    } else {
+                        onComplete(new_response_id, "test")
+                        agentStream.emitEnd()
+                    }
+                    break
+
                 default:
                     // console.log(ev)
                     break
@@ -150,8 +169,6 @@ export class Agent {
 
             }
         }
-
-        onComplete(new_response_id, "somemsg")
 
 
         // return responseStream
@@ -165,33 +182,100 @@ export class Agent {
             input: content,
             tools: this.toolDefinitions,
             stream,
-            parallel_tool_calls: false
+            parallel_tool_calls: true
         }
-    }
-
-    // type: "function_call_output", call_id, output
-    #generateFunctionCallOutput(output, call_id) {
-        return [{
-            type: "function_call_output",
-            call_id,
-            output: JSON.stringify(output)
-        }]
     }
 
 
 }
 
 
-export class Thread {
-    constructor({
-        id,
-        meta
-    }) {
-        this.id = id
-        this.meta = meta
+// export class Thread {
+//     constructor({
+//         id,
+//         meta
+//     }) {
+//         this.id = id
+//         this.meta = meta
 
-        //head -- used for previous_response_id and points to the previous message
-        this.head = null
-        this.content = []
+//         //head -- used for previous_response_id and points to the previous message
+//         this.head = null
+//         this.conversation = new Conversation()
+//     }
+// }
+
+
+
+export class FunctionCall {
+    constructor({
+        name,
+        args,
+        call_id,
+        func
+    }) {
+        // Function Data
+        this.name = name
+        this.args = args
+        this.call_id = call_id
+        this.func = func
+
+        // Execution state
+        this.promise = null
+        this.result = undefined
+        this.error = null
+        this.startTime = Date.now()
+        this.endTime = null
+
+        this.#execute()
     }
+
+    #execute() {
+        this.promise = this.#runAsync()
+    }
+
+    async #runAsync() {
+        try {
+            const parsedArgs = JSON.parse(this.args)
+
+            this.result = await this.func(parsedArgs)
+            this.endTime = Date.now()
+
+            return this.result
+        } catch (error) {
+            this.error = error
+
+            this.endTime = Date.now()
+
+            return undefined
+        }
+    }
+
+    async awaitCompletion() {
+        await this.promise
+        return !this.error
+    }
+
+
+
+    // validating input is a good idea, do this eventually hehehe
+    #validate() {
+
+    }
+
+    generateOutput() {
+        // Error handling with graceful degradation
+        const output = this.error
+            ? JSON.stringify({
+                error: this.error.message || "Function execution failed",
+                type: "error"
+              })
+            : JSON.stringify(this.result ?? null)
+
+        return {
+            type: "function_call_output",
+            call_id: this.call_id,
+            output
+        }
+    }
+
 }

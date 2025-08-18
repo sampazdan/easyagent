@@ -21,8 +21,8 @@ export class AgentStream extends EventEmitter {
     }
 
     // Agent.run() calls these methods to emit events
-    emitData(text) {
-        this.emit('data', text)
+    emitText(text) {
+        this.emit('text', text)
     }
 
     emitToolStart(name) {
