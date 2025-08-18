@@ -34,7 +34,7 @@ const MyAgent = new Agent({
             	properties: { a: { type: "number" }, b: { type: "number" } },
             	required: ["a", "b"],
             	additionalProperties: false
-          }
+			}
 		},
 	] // These follow standard OpenAI function format
 	toolFunctions: { // Provide local definitions for each function here
